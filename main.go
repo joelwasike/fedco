@@ -345,8 +345,10 @@ func (vs *VotingSystem) CheckCandidatesPosition(c *gin.Context) {
 func (vs *VotingSystem) GetCategories(c *gin.Context) {
 	var categories []CategoryResponse
 
+	// Order by ID in descending order to get the last category first
 	err := vs.DB.Model(&Category{}).
 		Select("id, name").
+		Order("id DESC").
 		Find(&categories).Error
 
 	if err != nil {
