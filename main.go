@@ -20,10 +20,11 @@ type VoterResult struct {
 }
 
 type CandidateResult struct {
-	ID        uint          `json:"id"`
-	Name      string        `json:"name"`
-	VoteCount int           `json:"vote_count"`
-	Voters    []VoterResult `json:"voters" gorm:"-"`
+	ID             uint          `json:"id"`
+	Name           string        `json:"name"`
+	VoteCount      int           `json:"vote_count"`
+	VotePercentage float64       `json:"vote_percentage"` // New field for vote percentage
+	Voters         []VoterResult `json:"voters" gorm:"-"`
 }
 
 // New structure for position results
@@ -303,7 +304,17 @@ func (vs *VotingSystem) CheckCandidatesPosition(c *gin.Context) {
 				Name: position.Name,
 			}
 
-			// Still count unique voters for results
+			// Count the total votes for the position
+			var totalVotes int64
+			if err := vs.DB.Model(&Vote{}).
+				Joins("JOIN candidates ON candidates.id = votes.candidate_id").
+				Where("candidates.position_id = ?", position.ID).
+				Count(&totalVotes).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to count total votes"})
+				return
+			}
+
+			// Get each candidate's vote count and calculate percentage
 			var candidates []CandidateResult
 			if err := vs.DB.Model(&Candidate{}).
 				Select("candidates.id, candidates.name, COUNT(DISTINCT votes.voter_id) as vote_count").
@@ -316,8 +327,15 @@ func (vs *VotingSystem) CheckCandidatesPosition(c *gin.Context) {
 				return
 			}
 
-			// For each candidate, get unique voters and their total individual votes
+			// For each candidate, calculate the percentage and retrieve voters
 			for i := range candidates {
+				if totalVotes > 0 {
+					candidates[i].VotePercentage = (float64(candidates[i].VoteCount) / float64(totalVotes)) * 100
+				} else {
+					candidates[i].VotePercentage = 0
+				}
+
+				// Retrieve unique voters for each candidate
 				var voters []VoterResult
 				if err := vs.DB.Table("votes").
 					Select("voters.name, voters.phone, COUNT(votes.id) as votes").
