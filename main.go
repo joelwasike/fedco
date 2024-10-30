@@ -652,8 +652,8 @@ func mpesaCallback(c *gin.Context) {
 
 func main() {
 	// Database connection string
-	//dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
-	dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	//dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
 
 	// Connecting to the database
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
