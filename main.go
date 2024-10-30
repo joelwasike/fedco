@@ -1,9 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -161,6 +168,36 @@ func (vs *VotingSystem) GetOrCreateVoter(name, phone string) (*Voter, error) {
 	}
 
 	return &newVoter, nil
+}
+
+// GetVotersSummary retrieves a list of all voters who have voted, along with their vote count.
+func (vs *VotingSystem) GetVotersSummary(c *gin.Context) {
+	var voters []VoterResult
+
+	// Query to get each voter's name, phone number, and count of votes
+	err := vs.DB.Table("votes").
+		Select("voters.name, voters.phone, COUNT(votes.id) AS votes").
+		Joins("JOIN voters ON votes.voter_id = voters.id").
+		Group("voters.id").
+		Order("votes DESC").
+		Scan(&voters).Error
+
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve voters"})
+		return
+	}
+
+	// Calculate the total number of unique voters and votes
+	var totalVoters int64
+	var totalVotes int64
+	vs.DB.Model(&Vote{}).Count(&totalVotes)
+	vs.DB.Model(&Voter{}).Joins("JOIN votes ON voters.id = votes.voter_id").Distinct().Count(&totalVoters)
+
+	c.JSON(http.StatusOK, gin.H{
+		"total_voters": totalVoters,
+		"total_votes":  totalVotes,
+		"voters":       voters,
+	})
 }
 
 // ProcessVote processes a vote, checking for validity
@@ -481,6 +518,138 @@ func (vs *VotingSystem) GetCandidatesByPosition(c *gin.Context) {
 	}
 }
 
+type Input struct {
+	Amount int    `json:"amount" binding:"required"` // Amount to be sent in the transaction
+	Phone  string `json:"phone" binding:"required"`  // Recipient's phone number in international format (e.g., "254712345678")
+}
+
+func mpesa(c *gin.Context) {
+	var input Input
+
+	// Bind JSON input
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Validate input
+	if input.Amount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Amount must be greater than 0"})
+		return
+	}
+
+	if !strings.HasPrefix(input.Phone, "254") || len(input.Phone) != 12 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Phone number must be in format 254XXXXXXXXX"})
+		return
+	}
+
+	externalId := fmt.Sprintf("TX_%d", time.Now().UnixNano())
+
+	// MPESA request payload
+	mpesaData := map[string]interface{}{
+		"impalaMerchantId": "FEdkjwneifniwebfCO",
+		"currency":         "KES",
+		"amount":           input.Amount,
+		"payerPhone":       input.Phone,
+		"mobileMoneySP":    "M-Pesa",
+		"externalId":       externalId,
+		"callbackUrl":      "https://9995-197-232-22-252.ngrok-free.app/mpesa-callback", // Update to your callback URL
+	}
+
+	// Convert mpesaData to JSON
+	jsonData, err := json.Marshal(mpesaData)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal MPESA request data"})
+		return
+	}
+
+	// Create request with additional headers
+	mpesaURL := "https://official.mam-laka.com/api/?resource=merchant&action=initiate_mobile_payment"
+	req, err := http.NewRequest("POST", mpesaURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create MPESA request"})
+		return
+	}
+
+	// Set required headers
+	req.Header.Set("Authorization", "Bearer ODhmNGY4Mjk5MTYzMDhiNWYxYmFjYTAyNzBiMzRhYjM=")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	// Create custom transport to handle HTTPS
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Only use this in development
+		},
+	}
+
+	// Create client with custom transport
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error sending MPESA request: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send MPESA request", "details": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Read and parse response
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading response body: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to read response"})
+		return
+	}
+
+	// Log the raw response for debugging
+	log.Printf("Raw response: %s", string(respBody))
+
+	// Notify the user that the transaction is initiated
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "MPESA STK push initiated, waiting for callback",
+		"transaction": externalId,
+	})
+}
+
+// mpesaCallback function to handle the callback and update transaction status
+func mpesaCallback(c *gin.Context) {
+	var callbackData map[string]interface{}
+
+	// Bind JSON callback data
+	if err := c.ShouldBindJSON(&callbackData); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid callback data"})
+		return
+	}
+
+	// Process the callback data to retrieve the transaction status
+	transactionId, _ := callbackData["externalId"].(string)
+	status, _ := callbackData["status"].(string) // Assuming "status" field exists in callback
+
+	// Respond based on the MPESA transaction status
+	if status == "Success" {
+		// Log success and notify user
+		log.Printf("Transaction %s completed successfully", transactionId)
+		c.JSON(http.StatusOK, gin.H{
+			"message":       "MPESA transaction completed successfully",
+			"transactionId": transactionId,
+			"status":        status,
+		})
+	} else {
+		// Log failure and notify user
+		log.Printf("Transaction %s failed with status: %s", transactionId, status)
+		c.JSON(http.StatusOK, gin.H{
+			"message":       "MPESA transaction failed",
+			"transactionId": transactionId,
+			"status":        status,
+		})
+	}
+}
+
 func main() {
 	// Database connection string
 	dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
@@ -516,6 +685,8 @@ func main() {
 	r.Use(cors.New(config))
 
 	// Define the routes
+	r.POST("/mpesa-callback", mpesaCallback)
+	r.POST("/mpesa", mpesa)
 	r.POST("/createcategories", vs.CreateCategory)
 	r.DELETE("/categories/:id", vs.DeleteCategory)
 	r.POST("/createpositions", vs.CreatePosition)
@@ -525,6 +696,7 @@ func main() {
 	r.GET("/categories", vs.GetCategories)
 	r.GET("/positions", vs.GetPositionsByCategory)
 	r.GET("/candidates", vs.GetCandidatesByPosition)
+	r.GET("/voters-summary", vs.GetVotersSummary)
 
 	r.Run(":8081")
 }
