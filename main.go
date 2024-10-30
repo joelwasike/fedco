@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -364,10 +365,9 @@ func (vs *VotingSystem) CheckCandidatesPosition(c *gin.Context) {
 				return
 			}
 
-			// For each candidate, calculate the percentage and retrieve voters
 			for i := range candidates {
 				if totalVotes > 0 {
-					candidates[i].VotePercentage = (float64(candidates[i].VoteCount) / float64(totalVotes)) * 100
+					candidates[i].VotePercentage = (math.Round((float64(candidates[i].VoteCount) / float64(totalVotes)) * 100))
 				} else {
 					candidates[i].VotePercentage = 0
 				}
@@ -574,7 +574,7 @@ func mpesa(c *gin.Context) {
 	// Set required headers
 	req.Header.Set("Authorization", "Bearer ODhmNGY4Mjk5MTYzMDhiNWYxYmFjYTAyNzBiMzRhYjM=")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
+	//req.Header.Set("Accept", "application/json")
 
 	// Create custom transport to handle HTTPS
 	transport := &http.Transport{
@@ -652,8 +652,8 @@ func mpesaCallback(c *gin.Context) {
 
 func main() {
 	// Database connection string
-	dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
-	//dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	//dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
 
 	// Connecting to the database
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
