@@ -578,14 +578,17 @@ func (vs *VotingSystem) CheckCandidatesPosition(c *gin.Context) {
 	c.JSON(http.StatusOK, categoryResults)
 }
 
-// GetCategories returns all available categories
 func (vs *VotingSystem) GetCategories(c *gin.Context) {
 	var categories []CategoryResponse
 
-	// Order by ID in descending order to get the last category first
+	// Build the query with a CASE statement for custom ordering
 	err := vs.DB.Model(&Category{}).
 		Select("id, name").
-		Order("id DESC").
+		Order("CASE WHEN name = 'MATATU' THEN 0 ELSE 1 END, " + // Sort MATATU differently
+			"CASE " +
+			"WHEN name = 'MATATU' THEN id " + // Ascending for MATATU
+			"ELSE -id " + // Descending for others (-id reverses the order)
+			"END").
 		Find(&categories).Error
 
 	if err != nil {
@@ -596,11 +599,9 @@ func (vs *VotingSystem) GetCategories(c *gin.Context) {
 	c.JSON(http.StatusOK, categories)
 }
 
-// GetPositionsByCategory returns all positions for a given category ID
 func (vs *VotingSystem) GetPositionsByCategory(c *gin.Context) {
 	categoryID := c.Query("category_id")
 	if categoryID == "" {
-		// If no category ID is provided, return all positions grouped by category
 		var positions []struct {
 			CategoryID   uint               `json:"category_id"`
 			CategoryName string             `json:"category_name"`
@@ -834,8 +835,8 @@ func mpesaCallback(c *gin.Context) {
 
 func main() {
 	// Database connection string
-	//dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
-	dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	//dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
 
 	// Connecting to the database
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
