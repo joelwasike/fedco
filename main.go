@@ -623,7 +623,7 @@ func (vs *VotingSystem) GetPositionsByCategory(c *gin.Context) {
 
 			// Apply ascending order for category_id 1, default order for others
 			if positions[i].CategoryID == 1 {
-				query = query.Order("id ASC")
+				query = query.Order("id DESC")
 			}
 
 			query.Find(&categoryPositions)
