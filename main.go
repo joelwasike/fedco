@@ -581,14 +581,9 @@ func (vs *VotingSystem) CheckCandidatesPosition(c *gin.Context) {
 func (vs *VotingSystem) GetCategories(c *gin.Context) {
 	var categories []CategoryResponse
 
-	// Build the query with a CASE statement for custom ordering
 	err := vs.DB.Model(&Category{}).
 		Select("id, name").
-		Order("CASE WHEN name = 'MATATU' THEN 0 ELSE 1 END, " + // Sort MATATU differently
-			"CASE " +
-			"WHEN name = 'MATATU' THEN id " + // Ascending for MATATU
-			"ELSE -id " + // Descending for others (-id reverses the order)
-			"END").
+		Order("id DESC").
 		Find(&categories).Error
 
 	if err != nil {
