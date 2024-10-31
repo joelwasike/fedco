@@ -614,25 +614,35 @@ func (vs *VotingSystem) GetPositionsByCategory(c *gin.Context) {
 			return
 		}
 
-		// For each category, get its positions
+		// For each category, get its positions with conditional ordering
 		for i := range positions {
 			var categoryPositions []PositionResponse
-			vs.DB.Model(&Position{}).
+			query := vs.DB.Model(&Position{}).
 				Select("id, name, category_id").
-				Where("category_id = ?", positions[i].CategoryID).
-				Find(&categoryPositions)
+				Where("category_id = ?", positions[i].CategoryID)
 
+			// Apply ascending order for category_id 1, default order for others
+			if positions[i].CategoryID == 1 {
+				query = query.Order("id ASC")
+			}
+
+			query.Find(&categoryPositions)
 			positions[i].Positions = categoryPositions
 		}
 
 		c.JSON(http.StatusOK, positions)
 	} else {
 		var positions []PositionResponse
-
-		err := vs.DB.Model(&Position{}).
+		query := vs.DB.Model(&Position{}).
 			Select("id, name, category_id").
-			Where("category_id = ?", categoryID).
-			Find(&positions).Error
+			Where("category_id = ?", categoryID)
+
+		// Apply ascending order for category_id 1, default order for others
+		if categoryID == "1" {
+			query = query.Order("id ASC")
+		}
+
+		err := query.Find(&positions).Error
 
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve positions"})
