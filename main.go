@@ -70,7 +70,7 @@ type Candidate struct {
 	gorm.Model
 	Name       string
 	PositionID uint
-	Votes      []Vote
+	Votes      []Vote `gorm:"foreignKey:CandidateID"`
 }
 
 type Voter struct {
@@ -78,12 +78,6 @@ type Voter struct {
 	Name  string
 	Phone string
 	Votes []Vote
-}
-
-type Vote struct {
-	gorm.Model
-	VoterID     uint
-	CandidateID uint `gorm:"index"` // Add an index for better performance
 }
 
 type CategoryResponse struct {
@@ -124,10 +118,22 @@ type VoteRequest struct {
 	VoterName   string `json:"voter_name" binding:"required"`
 	VoterPhone  string `json:"voter_phone" binding:"required"`
 	CandidateID uint   `json:"candidate_id" binding:"required"`
+	Amount      int    `json:"amount" binding:"required"`
 }
 
 type VotingSystem struct {
 	DB *gorm.DB
+}
+
+// MpesaCallback represents the callback data structure from the payment provider
+type MpesaCallback struct {
+	TransactionStatus string `json:"transactionStatus"`
+	TransactionReport string `json:"transactionReport"`
+	Currency          string `json:"currency"`
+	Amount            string `json:"amount"`
+	NetAmount         string `json:"netAmount"`
+	SecureId          string `json:"secureId"`
+	ExternalId        string `json:"externalId"`
 }
 
 func NewVotingSystem(db *gorm.DB) *VotingSystem {
@@ -135,6 +141,119 @@ func NewVotingSystem(db *gorm.DB) *VotingSystem {
 }
 
 // Vote handles the voting process
+// func (vs *VotingSystem) Vote(c *gin.Context) {
+// 	var voteReq VoteRequest
+// 	if err := c.ShouldBindJSON(&voteReq); err != nil {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+// 		return
+// 	}
+
+// 	err := vs.ProcessVote(voteReq.VoterName, voteReq.VoterPhone, voteReq.CandidateID)
+// 	if err != nil {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+// 		return
+// 	}
+
+// 	c.JSON(http.StatusOK, gin.H{"message": "Vote recorded successfully"})
+// }
+
+// test
+// test
+// test
+// test
+// test
+// test
+// test
+
+type Vote struct {
+	gorm.Model
+	VoterID     uint   `json:"voter_id"`
+	CandidateID uint   `gorm:"index" json:"candidate_id"`
+	ExternalID  string `gorm:"uniqueIndex;type:varchar(100);not null"`
+	Status      string `json:"status"`
+}
+
+// SavePendingVote simplified to only use externalId
+func (vs *VotingSystem) SavePendingVote(voterName, voterPhone string, candidateID uint, externalID string) error {
+	var candidate Candidate
+	if err := vs.DB.First(&candidate, candidateID).Error; err != nil {
+		return errors.New("candidate not found")
+	}
+
+	voter, err := vs.GetOrCreateVoter(voterName, voterPhone)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve or create voter: %w", err)
+	}
+
+	vote := Vote{
+		VoterID:     voter.ID,
+		CandidateID: candidateID,
+		ExternalID:  externalID,
+		Status:      "pending",
+	}
+
+	if err := vs.DB.Create(&vote).Error; err != nil {
+		return err
+	}
+
+	return nil
+}
+func (vs *VotingSystem) MpesaCallbackHandler(c *gin.Context) {
+	var callback MpesaCallback
+	if err := c.ShouldBindJSON(&callback); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid callback data"})
+		return
+	}
+
+	// Log the callback for debugging
+	log.Printf("Received M-Pesa callback: %+v", callback)
+
+	// Begin transaction
+	tx := vs.DB.Begin()
+	if tx.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+		return
+	}
+
+	// Find the pending vote
+	var vote Vote
+	if err := tx.Where("external_id = ? AND status = ?", callback.ExternalId, "pending").First(&vote).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusNotFound, gin.H{"error": "Pending vote not found"})
+		return
+	}
+
+	// Check transaction status
+	if callback.TransactionStatus == "COMPLETED" {
+		vote.Status = "completed"
+		// Save the updated vote
+		if err := tx.Save(&vote).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update vote status"})
+			return
+		}
+	} else {
+		// Delete the vote instead of marking it as failed
+		if err := tx.Delete(&vote).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete vote"})
+			return
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("Vote status updated to %s", vote.Status),
+		"status":  vote.Status,
+	})
+}
+
 func (vs *VotingSystem) Vote(c *gin.Context) {
 	var voteReq VoteRequest
 	if err := c.ShouldBindJSON(&voteReq); err != nil {
@@ -142,27 +261,85 @@ func (vs *VotingSystem) Vote(c *gin.Context) {
 		return
 	}
 
-	err := vs.ProcessVote(voteReq.VoterName, voteReq.VoterPhone, voteReq.CandidateID)
+	// Call MPESA payment function and get externalId
+	externalID, err := vs.InitiateMpesaTransaction(voteReq.VoterName, voteReq.VoterPhone, voteReq.Amount)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate MPESA transaction"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Vote recorded successfully"})
+	// Save vote with pending status
+	err = vs.SavePendingVote(voteReq.VoterName, voteReq.VoterPhone, voteReq.CandidateID, externalID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save pending vote"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":    "Vote recorded pending payment confirmation",
+		"externalId": externalID,
+	})
+}
+
+// InitiateMpesaTransaction initiates the transaction and returns an externalID
+// InitiateMpesaTransaction initiates the transaction and returns an externalID
+func (vs *VotingSystem) InitiateMpesaTransaction(voterName, voterPhone string, amount int) (string, error) {
+	// Generate unique externalID
+	externalID := fmt.Sprintf("TX_%d", time.Now().UnixNano())
+
+	// Prepare MPESA transaction payload
+	mpesaData := map[string]interface{}{
+		"impalaMerchantId": "FEdkjwneifniwebfCO",
+		"currency":         "KES",
+		"amount":           amount,
+		"payerPhone":       voterPhone,
+		"mobileMoneySP":    "M-Pesa",
+		"externalId":       externalID,
+		"callbackUrl":      "https://5763-102-213-93-28.ngrok-free.app/mpesa-callback",
+	}
+
+	// Convert payload to JSON
+	jsonData, err := json.Marshal(mpesaData)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal MPESA request data: %w", err)
+	}
+
+	// Create request with headers
+	req, err := http.NewRequest("POST", "https://official.mam-laka.com/api/?resource=merchant&action=initiate_mobile_payment", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return "", fmt.Errorf("failed to create MPESA request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer ODhmNGY4Mjk5MTYzMDhiNWYxYmFjYTAyNzBiMzRhYjM=")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Custom transport for HTTPS
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+		Timeout: 30 * time.Second,
+	}
+
+	// Send request
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("failed to send MPESA request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Log and confirm initiation
+	log.Printf("MPESA initiation response: %s", string(respBody))
+	return externalID, nil
 }
 
 func (vs *VotingSystem) GetOrCreateVoter(name, phone string) (*Voter, error) {
-	var voter Voter
-	result := vs.DB.Where("name = ? OR phone = ?", name, phone).First(&voter)
-	if result.Error == nil {
-		// Voter already exists
-		if voter.Name != name || voter.Phone != phone {
-			return nil, errors.New("voter with this name or phone number already exists")
-		}
-		return &voter, nil
-	}
-
-	// Create new voter
+	// Directly create a new voter without checking for existing ones
 	newVoter := Voter{Name: name, Phone: phone}
 	if err := vs.DB.Create(&newVoter).Error; err != nil {
 		return nil, errors.New("failed to create voter")
@@ -175,10 +352,11 @@ func (vs *VotingSystem) GetOrCreateVoter(name, phone string) (*Voter, error) {
 func (vs *VotingSystem) GetVotersSummary(c *gin.Context) {
 	var voters []VoterResult
 
-	// Query to get each voter's name, phone number, and count of votes
+	// Query to get each voter's name, phone number, and count of "completed" votes
 	err := vs.DB.Table("votes").
 		Select("voters.name, voters.phone, COUNT(votes.id) AS votes").
 		Joins("JOIN voters ON votes.voter_id = voters.id").
+		Where("votes.status = ?", "completed").
 		Group("voters.id").
 		Order("votes DESC").
 		Scan(&voters).Error
@@ -188,11 +366,15 @@ func (vs *VotingSystem) GetVotersSummary(c *gin.Context) {
 		return
 	}
 
-	// Calculate the total number of unique voters and votes
+	// Calculate the total number of unique voters and "completed" votes
 	var totalVoters int64
 	var totalVotes int64
-	vs.DB.Model(&Vote{}).Count(&totalVotes)
-	vs.DB.Model(&Voter{}).Joins("JOIN votes ON voters.id = votes.voter_id").Distinct().Count(&totalVoters)
+	vs.DB.Model(&Vote{}).Where("status = ?", "completed").Count(&totalVotes)
+	vs.DB.Model(&Voter{}).
+		Joins("JOIN votes ON voters.id = votes.voter_id").
+		Where("votes.status = ?", "completed").
+		Distinct().
+		Count(&totalVoters)
 
 	c.JSON(http.StatusOK, gin.H{
 		"total_voters": totalVoters,
@@ -342,21 +524,21 @@ func (vs *VotingSystem) CheckCandidatesPosition(c *gin.Context) {
 				Name: position.Name,
 			}
 
-			// Count the total votes for the position
+			// Count the total "completed" votes for the position
 			var totalVotes int64
 			if err := vs.DB.Model(&Vote{}).
 				Joins("JOIN candidates ON candidates.id = votes.candidate_id").
-				Where("candidates.position_id = ?", position.ID).
+				Where("candidates.position_id = ? AND votes.status = ?", position.ID, "completed").
 				Count(&totalVotes).Error; err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to count total votes"})
 				return
 			}
 
-			// Get each candidate's vote count and calculate percentage
+			// Get each candidate's "completed" vote count and calculate percentage
 			var candidates []CandidateResult
 			if err := vs.DB.Model(&Candidate{}).
 				Select("candidates.id, candidates.name, COUNT(DISTINCT votes.voter_id) as vote_count").
-				Joins("LEFT JOIN votes ON candidates.id = votes.candidate_id").
+				Joins("LEFT JOIN votes ON candidates.id = votes.candidate_id AND votes.status = ?", "completed").
 				Where("candidates.position_id = ?", position.ID).
 				Group("candidates.id").
 				Order("vote_count DESC").
@@ -367,17 +549,17 @@ func (vs *VotingSystem) CheckCandidatesPosition(c *gin.Context) {
 
 			for i := range candidates {
 				if totalVotes > 0 {
-					candidates[i].VotePercentage = (math.Round((float64(candidates[i].VoteCount) / float64(totalVotes)) * 100))
+					candidates[i].VotePercentage = math.Round((float64(candidates[i].VoteCount) / float64(totalVotes)) * 100)
 				} else {
 					candidates[i].VotePercentage = 0
 				}
 
-				// Retrieve unique voters for each candidate
+				// Retrieve unique voters for each candidate with "completed" status votes
 				var voters []VoterResult
 				if err := vs.DB.Table("votes").
 					Select("voters.name, voters.phone, COUNT(votes.id) as votes").
 					Joins("JOIN voters ON votes.voter_id = voters.id").
-					Where("votes.candidate_id = ?", candidates[i].ID).
+					Where("votes.candidate_id = ? AND votes.status = ?", candidates[i].ID, "completed").
 					Group("voters.id").
 					Scan(&voters).Error; err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to retrieve voter details"})
@@ -652,8 +834,8 @@ func mpesaCallback(c *gin.Context) {
 
 func main() {
 	// Database connection string
-	dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
-	//dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	//dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
 
 	// Connecting to the database
 	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
@@ -685,7 +867,7 @@ func main() {
 	r.Use(cors.New(config))
 
 	// Define the routes
-	r.POST("/mpesa-callback", mpesaCallback)
+	r.POST("/mpesa-callback", vs.MpesaCallbackHandler)
 	r.POST("/mpesa", mpesa)
 	r.POST("/createcategories", vs.CreateCategory)
 	r.DELETE("/categories/:id", vs.DeleteCategory)
@@ -700,3 +882,174 @@ func main() {
 
 	r.Run(":8081")
 }
+
+// type Vote struct {
+//     gorm.Model
+//     VoterID     uint   `gorm:"not null"`
+//     CandidateID uint   `gorm:"index;not null"`
+//     ExternalID  string `gorm:"uniqueIndex;type:varchar(100);not null"` // Explicit constraint definition
+//     Status      string `gorm:"type:varchar(20);not null;default:'pending'"`
+//     Voter       Voter     `gorm:"foreignKey:VoterID"`
+//     Candidate   Candidate `gorm:"foreignKey:CandidateID"`
+// }
+
+// // SavePendingVote simplified to only use externalId
+// func (vs *VotingSystem) SavePendingVote(voterName, voterPhone string, candidateID uint, externalID string) error {
+// 	var candidate Candidate
+// 	if err := vs.DB.First(&candidate, candidateID).Error; err != nil {
+// 		return errors.New("candidate not found")
+// 	}
+
+// 	voter, err := vs.GetOrCreateVoter(voterName, voterPhone)
+// 	if err != nil {
+// 		return err
+// 	}
+
+// 	vote := Vote{
+// 		VoterID:     voter.ID,
+// 		CandidateID: candidateID,
+// 		ExternalID:  externalID,
+// 		Status:      "pending",
+// 	}
+
+// 	if err := vs.DB.Create(&vote).Error; err != nil {
+// 		return err
+// 	}
+
+// 	return nil
+// }
+// func (vs *VotingSystem) MpesaCallbackHandler(c *gin.Context) {
+// 	var callback MpesaCallback
+// 	if err := c.ShouldBindJSON(&callback); err != nil {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid callback data"})
+// 		return
+// 	}
+
+// 	// Log the callback for debugging
+// 	log.Printf("Received M-Pesa callback: %+v", callback)
+
+// 	// Begin transaction
+// 	tx := vs.DB.Begin()
+// 	if tx.Error != nil {
+// 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to start transaction"})
+// 		return
+// 	}
+
+// 	// Find the pending vote
+// 	var vote Vote
+// 	if err := tx.Where("external_id = ? AND status = ?", callback.ExternalId, "pending").First(&vote).Error; err != nil {
+// 		tx.Rollback()
+// 		c.JSON(http.StatusNotFound, gin.H{"error": "Pending vote not found"})
+// 		return
+// 	}
+
+// 	// Update vote based on transaction status
+// 	if callback.TransactionStatus == "COMPLETED" {
+// 		vote.Status = "completed"
+// 	} else {
+// 		vote.Status = "failed"
+// 	}
+
+// 	// Save the updated vote
+// 	if err := tx.Save(&vote).Error; err != nil {
+// 		tx.Rollback()
+// 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update vote status"})
+// 		return
+// 	}
+
+// 	// Commit transaction
+// 	if err := tx.Commit().Error; err != nil {
+// 		tx.Rollback()
+// 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+// 		return
+// 	}
+
+// 	c.JSON(http.StatusOK, gin.H{
+// 		"message": fmt.Sprintf("Vote status updated to %s", vote.Status),
+// 		"status":  vote.Status,
+// 	})
+// }
+
+// func (vs *VotingSystem) Vote(c *gin.Context) {
+// 	var voteReq VoteRequest
+// 	if err := c.ShouldBindJSON(&voteReq); err != nil {
+// 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+// 		return
+// 	}
+
+// 	// Call MPESA payment function and get externalId
+// 	externalID, err := vs.InitiateMpesaTransaction(voteReq.VoterName, voteReq.VoterPhone)
+// 	if err != nil {
+// 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate MPESA transaction"})
+// 		return
+// 	}
+
+// 	// Save vote with pending status
+// 	err = vs.SavePendingVote(voteReq.VoterName, voteReq.VoterPhone, voteReq.CandidateID, externalID)
+// 	if err != nil {
+// 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save pending vote"})
+// 		return
+// 	}
+
+// 	c.JSON(http.StatusOK, gin.H{
+// 		"message":    "Vote recorded pending payment confirmation",
+// 		"externalId": externalID,
+// 	})
+// }
+
+// // InitiateMpesaTransaction initiates the transaction and returns an externalID
+// // InitiateMpesaTransaction initiates the transaction and returns an externalID
+// func (vs *VotingSystem) InitiateMpesaTransaction(voterName, voterPhone string) (string, error) {
+// 	// Generate unique externalID
+// 	externalID := fmt.Sprintf("TX_%d", time.Now().UnixNano())
+
+// 	// Prepare MPESA transaction payload
+// 	mpesaData := map[string]interface{}{
+// 		"impalaMerchantId": "FEdkjwneifniwebfCO",
+// 		"currency":         "KES",
+// 		"amount":           10,
+// 		"payerPhone":       voterPhone,
+// 		"mobileMoneySP":    "M-Pesa",
+// 		"externalId":       externalID,
+// 		"callbackUrl":      "https://8eab-102-213-93-28.ngrok-free.app/mpesa-callback",
+// 	}
+
+// 	// Convert payload to JSON
+// 	jsonData, err := json.Marshal(mpesaData)
+// 	if err != nil {
+// 		return "", fmt.Errorf("failed to marshal MPESA request data: %w", err)
+// 	}
+
+// 	// Create request with headers
+// 	req, err := http.NewRequest("POST", "https://official.mam-laka.com/api/?resource=merchant&action=initiate_mobile_payment", bytes.NewBuffer(jsonData))
+// 	if err != nil {
+// 		return "", fmt.Errorf("failed to create MPESA request: %w", err)
+// 	}
+// 	req.Header.Set("Authorization", "Bearer ODhmNGY4Mjk5MTYzMDhiNWYxYmFjYTAyNzBiMzRhYjM=")
+// 	req.Header.Set("Content-Type", "application/json")
+
+// 	// Custom transport for HTTPS
+// 	client := &http.Client{
+// 		Transport: &http.Transport{
+// 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+// 		},
+// 		Timeout: 30 * time.Second,
+// 	}
+
+// 	// Send request
+// 	resp, err := client.Do(req)
+// 	if err != nil {
+// 		return "", fmt.Errorf("failed to send MPESA request: %w", err)
+// 	}
+// 	defer resp.Body.Close()
+
+// 	// Read response
+// 	respBody, err := io.ReadAll(resp.Body)
+// 	if err != nil {
+// 		return "", fmt.Errorf("failed to read response: %w", err)
+// 	}
+
+// 	// Log and confirm initiation
+// 	log.Printf("MPESA initiation response: %s", string(respBody))
+// 	return externalID, nil
+// }
