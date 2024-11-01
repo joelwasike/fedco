@@ -171,22 +171,13 @@ type Vote struct {
 	CandidateID uint   `gorm:"index" json:"candidate_id"`
 	ExternalID  string `gorm:"uniqueIndex;type:varchar(100);not null"`
 	Status      string `json:"status"`
-	VoteCount   int    `json:"vote_count"` // New field to store number of votes
 }
 
 // SavePendingVote simplified to only use externalId
-func (vs *VotingSystem) SavePendingVote(voterName, voterPhone string, candidateID uint, externalID string, amount int) error {
+func (vs *VotingSystem) SavePendingVote(voterName, voterPhone string, candidateID uint, externalID string) error {
 	var candidate Candidate
 	if err := vs.DB.First(&candidate, candidateID).Error; err != nil {
 		return errors.New("candidate not found")
-	}
-
-	// Calculate number of votes based on amount (10 shillings per vote)
-	voteCount := amount / 10
-
-	// Ensure at least one vote for amounts less than 10
-	if voteCount < 1 {
-		return errors.New("amount must be at least 10 shillings")
 	}
 
 	voter, err := vs.GetOrCreateVoter(voterName, voterPhone)
@@ -199,7 +190,6 @@ func (vs *VotingSystem) SavePendingVote(voterName, voterPhone string, candidateI
 		CandidateID: candidateID,
 		ExternalID:  externalID,
 		Status:      "pending",
-		VoteCount:   voteCount,
 	}
 
 	if err := vs.DB.Create(&vote).Error; err != nil {
@@ -208,7 +198,6 @@ func (vs *VotingSystem) SavePendingVote(voterName, voterPhone string, candidateI
 
 	return nil
 }
-
 func (vs *VotingSystem) MpesaCallbackHandler(c *gin.Context) {
 	var callback MpesaCallback
 	if err := c.ShouldBindJSON(&callback); err != nil {
@@ -226,93 +215,49 @@ func (vs *VotingSystem) MpesaCallbackHandler(c *gin.Context) {
 		return
 	}
 
-	// Find the pending vote with a longer timeout
+	// Find the pending vote
 	var vote Vote
-	if err := tx.Where("external_id = ?", callback.ExternalId).First(&vote).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			// If the vote is not found, log it and return a more specific error
-			log.Printf("Vote not found for externalId: %s. This might be due to timing issues.", callback.ExternalId)
-			c.JSON(http.StatusOK, gin.H{
-				"message": "No pending vote found for this transaction",
-				"status":  "acknowledged",
-			})
-			return
-		}
+	if err := tx.Where("external_id = ? AND status = ?", callback.ExternalId, "pending").First(&vote).Error; err != nil {
 		tx.Rollback()
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Pending vote not found"})
 		return
 	}
-
-	// Parse the amount to calculate votes
-	amount, err := strconv.ParseFloat(callback.Amount, 64)
-	if err != nil {
-		tx.Rollback()
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid amount format"})
-		return
-	}
-
-	// Calculate number of votes based on amount (10 shillings per vote)
-	voteCount := int(amount / 10)
 
 	// Check transaction status
 	if callback.TransactionStatus == "COMPLETED" {
-		// Update vote status and count
 		vote.Status = "completed"
-		vote.VoteCount = voteCount // Update the vote count based on the actual amount paid
-
 		// Save the updated vote
 		if err := tx.Save(&vote).Error; err != nil {
 			tx.Rollback()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update vote status"})
 			return
 		}
-
-		// Commit transaction
-		if err := tx.Commit().Error; err != nil {
-			tx.Rollback()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"message":        fmt.Sprintf("Vote status updated to completed. Recorded %d votes", voteCount),
-			"status":         "completed",
-			"votes_recorded": voteCount,
-		})
-		return
 	} else {
-		// If transaction failed, mark vote as failed or delete it
+		// Delete the vote instead of marking it as failed
 		if err := tx.Delete(&vote).Error; err != nil {
 			tx.Rollback()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete failed vote"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete vote"})
 			return
 		}
+	}
 
-		// Commit transaction
-		if err := tx.Commit().Error; err != nil {
-			tx.Rollback()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
-			return
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"message": "Vote cancelled due to failed payment",
-			"status":  "cancelled",
-		})
+	// Commit transaction
+	if err := tx.Commit().Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
 		return
 	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": fmt.Sprintf("Vote status updated to %s", vote.Status),
+		"status":  vote.Status,
+	})
 }
 
 func (vs *VotingSystem) Vote(c *gin.Context) {
 	var voteReq VoteRequest
 	if err := c.ShouldBindJSON(&voteReq); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Validate minimum amount
-	if voteReq.Amount < 10 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Minimum amount is 10 shillings"})
 		return
 	}
 
@@ -323,15 +268,15 @@ func (vs *VotingSystem) Vote(c *gin.Context) {
 		return
 	}
 
-	// Save vote with pending status, including the amount for vote calculation
-	err = vs.SavePendingVote(voteReq.VoterName, voteReq.VoterPhone, voteReq.CandidateID, externalID, voteReq.Amount)
+	// Save vote with pending status
+	err = vs.SavePendingVote(voteReq.VoterName, voteReq.VoterPhone, voteReq.CandidateID, externalID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save pending vote"})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"message":    fmt.Sprintf("Recorded %d votes pending payment confirmation", voteReq.Amount/10),
+		"message":    "Vote recorded pending payment confirmation",
 		"externalId": externalID,
 	})
 }
@@ -407,9 +352,9 @@ func (vs *VotingSystem) GetOrCreateVoter(name, phone string) (*Voter, error) {
 func (vs *VotingSystem) GetVotersSummary(c *gin.Context) {
 	var voters []VoterResult
 
-	// Updated query to sum the vote_count instead of counting votes
+	// Query to get each voter's name, phone number, and count of "completed" votes
 	err := vs.DB.Table("votes").
-		Select("voters.name, voters.phone, SUM(votes.vote_count) as votes").
+		Select("voters.name, voters.phone, COUNT(votes.id) AS votes").
 		Joins("JOIN voters ON votes.voter_id = voters.id").
 		Where("votes.status = ?", "completed").
 		Group("voters.id").
@@ -421,16 +366,10 @@ func (vs *VotingSystem) GetVotersSummary(c *gin.Context) {
 		return
 	}
 
-	// Calculate total votes by summing vote_count
-	var totalVotes int64
-	vs.DB.Model(&Vote{}).
-		Where("status = ?", "completed").
-		Select("SUM(vote_count)").
-		Row().
-		Scan(&totalVotes)
-
-	// Count unique voters
+	// Calculate the total number of unique voters and "completed" votes
 	var totalVoters int64
+	var totalVotes int64
+	vs.DB.Model(&Vote{}).Where("status = ?", "completed").Count(&totalVotes)
 	vs.DB.Model(&Voter{}).
 		Joins("JOIN votes ON voters.id = votes.voter_id").
 		Where("votes.status = ?", "completed").
