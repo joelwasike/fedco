@@ -226,43 +226,81 @@ func (vs *VotingSystem) MpesaCallbackHandler(c *gin.Context) {
 		return
 	}
 
-	// Find the pending vote
+	// Find the pending vote with a longer timeout
 	var vote Vote
-	if err := tx.Where("external_id = ? AND status = ?", callback.ExternalId, "pending").First(&vote).Error; err != nil {
+	if err := tx.Where("external_id = ?", callback.ExternalId).First(&vote).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			// If the vote is not found, log it and return a more specific error
+			log.Printf("Vote not found for externalId: %s. This might be due to timing issues.", callback.ExternalId)
+			c.JSON(http.StatusOK, gin.H{
+				"message": "No pending vote found for this transaction",
+				"status":  "acknowledged",
+			})
+			return
+		}
 		tx.Rollback()
-		c.JSON(http.StatusNotFound, gin.H{"error": "Pending vote not found"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
 	}
 
+	// Parse the amount to calculate votes
+	amount, err := strconv.ParseFloat(callback.Amount, 64)
+	if err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid amount format"})
+		return
+	}
+
+	// Calculate number of votes based on amount (10 shillings per vote)
+	voteCount := int(amount / 10)
+
 	// Check transaction status
 	if callback.TransactionStatus == "COMPLETED" {
+		// Update vote status and count
 		vote.Status = "completed"
+		vote.VoteCount = voteCount // Update the vote count based on the actual amount paid
+
 		// Save the updated vote
 		if err := tx.Save(&vote).Error; err != nil {
 			tx.Rollback()
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update vote status"})
 			return
 		}
-	} else {
-		// Delete the vote instead of marking it as failed
-		if err := tx.Delete(&vote).Error; err != nil {
+
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
 			tx.Rollback()
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete vote"})
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
 			return
 		}
-	}
 
-	// Commit transaction
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+		c.JSON(http.StatusOK, gin.H{
+			"message":        fmt.Sprintf("Vote status updated to completed. Recorded %d votes", voteCount),
+			"status":         "completed",
+			"votes_recorded": voteCount,
+		})
+		return
+	} else {
+		// If transaction failed, mark vote as failed or delete it
+		if err := tx.Delete(&vote).Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete failed vote"})
+			return
+		}
+
+		// Commit transaction
+		if err := tx.Commit().Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to commit transaction"})
+			return
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"message": "Vote cancelled due to failed payment",
+			"status":  "cancelled",
+		})
 		return
 	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"message": fmt.Sprintf("Vote status updated to %s", vote.Status),
-		"status":  vote.Status,
-	})
 }
 
 func (vs *VotingSystem) Vote(c *gin.Context) {
