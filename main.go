@@ -244,22 +244,39 @@ func (vs *VotingSystem) MpesaCallbackHandler(c *gin.Context) {
 
 func (vs *VotingSystem) Vote(c *gin.Context) {
 	var voteReq VoteRequest
+
+	// Log incoming request body
+	body, _ := io.ReadAll(c.Request.Body)
+	log.Printf("Incoming Vote Request Body: %s", string(body))
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(body)) // Reassign body to reuse later
+
 	if err := c.ShouldBindJSON(&voteReq); err != nil {
+		log.Printf("Error binding JSON: %s", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
+	log.Printf("Vote Request: %+v", voteReq)
+
+	// Initiate MPESA transaction
 	externalID, err := vs.InitiateMpesaTransaction(voteReq.VoterName, voteReq.VoterPhone, voteReq.Amount)
 	if err != nil {
+		log.Printf("Error initiating MPESA transaction: %s", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initiate MPESA transaction"})
 		return
 	}
 
+	log.Printf("MPESA Transaction initiated with ExternalID: %s", externalID)
+
+	// Save pending vote
 	err = vs.SavePendingVote(voteReq.VoterName, voteReq.VoterPhone, voteReq.CandidateID, externalID, voteReq.Amount)
 	if err != nil {
+		log.Printf("Error saving pending vote: %s", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save pending vote"})
 		return
 	}
+
+	log.Println("Vote successfully recorded pending payment confirmation")
 
 	c.JSON(http.StatusOK, gin.H{
 		"message":    "Vote recorded pending payment confirmation",
@@ -270,36 +287,36 @@ func (vs *VotingSystem) Vote(c *gin.Context) {
 // InitiateMpesaTransaction initiates the transaction and returns an externalID
 // InitiateMpesaTransaction initiates the transaction and returns an externalID
 func (vs *VotingSystem) InitiateMpesaTransaction(voterName, voterPhone string, amount int) (string, error) {
-	// Generate unique externalID
 	externalID := fmt.Sprintf("FEDCO_%d", time.Now().UnixNano())
+	log.Printf("Generated ExternalID: %s", externalID)
 
-	// Prepare MPESA transaction payload
 	mpesaData := map[string]interface{}{
-		"impalaMerchantId": "FEdkjwneifniwebfCO",
+		"impalaMerchantId": "FEdkjwneifniwebfCcO",
 		"currency":         "KES",
 		"amount":           amount,
 		"payerPhone":       voterPhone,
 		"mobileMoneySP":    "M-Pesa",
 		"externalId":       externalID,
-		//"callbackUrl":      "https://fedcoapi.mam-laka.com/mpesa-callback",
-		"callbackUrl": "https://98a1-197-232-22-252.ngrok-free.app/mpesa-callback",
+		//"callbackUrl":      "https://eb9b-102-213-93-109.ngrok-free.app/mpesa-callback",
+		"callbackUrl": "https://fedcoapi.mam-laka.com/mpesa-callback",
 	}
 
-	// Convert payload to JSON
 	jsonData, err := json.Marshal(mpesaData)
 	if err != nil {
+		log.Printf("Error marshaling MPESA data: %s", err)
 		return "", fmt.Errorf("failed to marshal MPESA request data: %w", err)
 	}
 
-	// Create request with headers
+	log.Printf("MPESA Request Payload: %s", string(jsonData))
+
 	req, err := http.NewRequest("POST", "https://official.mam-laka.com/api/?resource=merchant&action=initiate_mobile_payment", bytes.NewBuffer(jsonData))
 	if err != nil {
+		log.Printf("Error creating MPESA request: %s", err)
 		return "", fmt.Errorf("failed to create MPESA request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer ODhmNGY4Mjk5MTYzMDhiNWYxYmFjYTAyNzBiMzRhYjM=")
+	req.Header.Set("Authorization", "Bearer ZWNmNTdmODE2MmJiY2U4MmVjNmNlNGM2MTNmYTFmODQ=")
 	req.Header.Set("Content-Type", "application/json")
 
-	// Custom transport for HTTPS
 	client := &http.Client{
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -307,21 +324,21 @@ func (vs *VotingSystem) InitiateMpesaTransaction(voterName, voterPhone string, a
 		Timeout: 30 * time.Second,
 	}
 
-	// Send request
 	resp, err := client.Do(req)
 	if err != nil {
+		log.Printf("Error sending MPESA request: %s", err)
 		return "", fmt.Errorf("failed to send MPESA request: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Read response
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		log.Printf("Error reading MPESA response: %s", err)
 		return "", fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Log and confirm initiation
-	log.Printf("MPESA initiation response: %s", string(respBody))
+	log.Printf("MPESA Response: %s", string(respBody))
+
 	return externalID, nil
 }
 
@@ -809,7 +826,7 @@ func mpesaCallback(c *gin.Context) {
 
 func main() {
 	dsn := "mamlakadev:@Mamlaka2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
-	//dsn := "joelwasike:@Webuye2021@tcp(https://localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
+	//dsn := "joelwasike:@Webuye2021@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
 
 	//dsn := "root:root@tcp(localhost:3306)/fedco?charset=utf8mb4&parseTime=True&loc=Local"
 
